@@ -1,16 +1,14 @@
 #!/usr/bin/env python3
 """
-IG-OSINT v1.2
-Public Instagram profile OSINT analyzer with interactive proxy setup.
+IG-OSINT v1.3
+Public Instagram profile OSINT analyzer with session support + safe proxy.
 
 Features:
   - Public profile scraping via Instaloader
   - Image download + EXIF/GPS extraction via Pillow
   - Multimodal analysis via Google Gemini 2.5 Flash
-  - Interactive proxy IP prompt + all traffic routed through proxy (IP masking)
-  - Terminal report + saved Markdown/JSON evidence
-
-Cross-platform: Kali Linux, Termux (Android), generic Linux.
+  - Interactive proxy IP prompt + DNS-leak safe SOCKS5h
+  - Instaloader session support to bypass 429 rate limits
 """
 
 from __future__ import annotations
@@ -52,14 +50,13 @@ from rich.table import Table
 # ---------------------------------------------------------------------------
 
 TOOL_NAME = "IG-OSINT"
-VERSION = "1.2"
+VERSION = "1.3"
 CONFIG_DIR = Path.home() / ".ig_osint"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 OUTPUT_DIR = Path("output")
 GEMINI_MODEL = "gemini-2.5-flash"
 
-# Default Tor proxy (Termux/Kali both use 9050)
-DEFAULT_TOR_PROXY = "socks5://127.0.0.1:9050"
+DEFAULT_TOR_PROXY = "socks5h://127.0.0.1:9050" # 'h' for proxy-side DNS
 
 USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -81,19 +78,15 @@ console = Console()
 # Proxy helpers
 # ---------------------------------------------------------------------------
 
-
 def normalize_proxy(proxy_url: str) -> str:
-    """Normalize proxy URL; auto-add scheme if missing."""
     proxy_url = proxy_url.strip()
     if not proxy_url:
         return ""
-    if not proxy_url.startswith(("http://", "https://", "socks5://", "socks4://")):
+    if not proxy_url.startswith(("http://", "https://", "socks5://", "socks5h://", "socks4://")):
         proxy_url = f"http://{proxy_url}"
     return proxy_url
 
-
 def apply_proxy_env(proxy_url: str) -> None:
-    """Set proxy for all child requests (Instaloader + requests)."""
     if not proxy_url:
         return
     os.environ["HTTP_PROXY"] = proxy_url
@@ -101,19 +94,12 @@ def apply_proxy_env(proxy_url: str) -> None:
     os.environ["http_proxy"] = proxy_url
     os.environ["https_proxy"] = proxy_url
 
-
 def apply_proxy_to_loader(loader: instaloader.Instaloader, proxy_url: str) -> None:
-    """Force Instaloader context session to use proxy."""
     if not proxy_url:
         return
     loader.context._session.proxies = {"http": proxy_url, "https": proxy_url}
 
-
 def verify_proxy(proxy_url: str) -> Optional[str]:
-    """
-    Verify proxy connectivity by hitting an IP echo service.
-    Returns the proxy exit IP, or None on failure.
-    """
     try:
         proxies = {"http": proxy_url, "https": proxy_url}
         response = requests.get(
@@ -126,19 +112,14 @@ def verify_proxy(proxy_url: str) -> Optional[str]:
     except Exception:
         return None
 
-
 def prompt_proxy() -> str:
-    """
-    Ask the user for a proxy IP/URL. Default to Tor if user presses Enter.
-    """
     console.print(
         Panel(
             "[bold cyan]Proxy Configuration[/bold cyan]\n\n"
             f"Press [bold]Enter[/bold] to use Tor ([cyan]{DEFAULT_TOR_PROXY}[/cyan])\n"
             "Or type a custom proxy URL:\n"
-            "  • [dim]socks5://127.0.0.1:9050[/dim]        (Tor)\n"
+            "  • [dim]socks5h://127.0.0.1:9050[/dim]        (Tor - Safe DNS)\n"
             "  • [dim]http://user:pass@1.2.3.4:8080[/dim]  (HTTP proxy)\n"
-            "  • [dim]socks5://1.2.3.4:1080[/dim]          (SOCKS5)\n"
             "  • [dim]none[/dim]                            (disable proxy)",
             title="🌐 Proxy Setup",
             border_style="cyan",
@@ -156,22 +137,34 @@ def prompt_proxy() -> str:
 
     exit_ip = verify_proxy(proxy_url)
     if exit_ip:
-        console.print(
-            f"[green]✓ Proxy working. Exit IP:[/green] [cyan]{exit_ip}[/cyan]"
-        )
+        console.print(f"[green]✓ Proxy working. Exit IP:[/green] [cyan]{exit_ip}[/cyan]")
     else:
-        console.print(
-            "[yellow]⚠ Could not verify proxy. Continuing anyway — "
-            "check that Tor or your proxy is running.[/yellow]"
-        )
+        console.print("[yellow]⚠ Could not verify proxy. Continuing anyway.[/yellow]")
 
     return proxy_url
 
-
 # ---------------------------------------------------------------------------
-# API key / config helpers
+# Session & API key helpers
 # ---------------------------------------------------------------------------
 
+def prompt_session() -> Optional[str]:
+    """Ask for an Instaloader session file to bypass 429 limits."""
+    session_files = list(Path.cwd().glob("session-*"))
+    
+    if session_files:
+        console.print("[green]Found existing Instaloader session files:[/green]")
+        for i, sf in enumerate(session_files, 1):
+            console.print(f"  {i}. {sf.name}")
+        
+        choice = Prompt.ask(
+            "Enter session file name (or press Enter to skip)", 
+            default=""
+        ).strip()
+        if choice:
+            return choice
+    
+    console.print("\n[dim]Tip: Run 'instaloader --login=your_username' in another terminal to create a session file and bypass 429 errors.[/dim]")
+    return None
 
 def load_saved_api_key() -> Optional[str]:
     try:
@@ -183,7 +176,6 @@ def load_saved_api_key() -> Optional[str]:
     except Exception:
         pass
     return None
-
 
 def save_api_key(api_key: str) -> None:
     try:
@@ -199,12 +191,10 @@ def save_api_key(api_key: str) -> None:
     except Exception as exc:
         console.print(f"[yellow]Could not save API key: {exc}[/yellow]")
 
-
 def mask_key(key: str) -> str:
     if len(key) <= 8:
         return "****"
     return f"{key[:4]}{'*' * (len(key) - 8)}{key[-4:]}"
-
 
 def resolve_api_key(reset: bool = False) -> Optional[str]:
     if reset and CONFIG_FILE.exists():
@@ -234,11 +224,9 @@ def resolve_api_key(reset: bool = False) -> Optional[str]:
         return key
     return None
 
-
 # ---------------------------------------------------------------------------
 # EXIF helpers
 # ---------------------------------------------------------------------------
-
 
 def _rational_to_float(value: Any) -> Optional[float]:
     try:
@@ -247,7 +235,6 @@ def _rational_to_float(value: Any) -> Optional[float]:
         return float(value)
     except Exception:
         return None
-
 
 def _gps_coord_to_decimal(coord: Any, ref: Any) -> Optional[float]:
     try:
@@ -262,7 +249,6 @@ def _gps_coord_to_decimal(coord: Any, ref: Any) -> Optional[float]:
         return round(decimal, 6)
     except Exception:
         return None
-
 
 def extract_exif(image_path: Path) -> Dict[str, Any]:
     result: Dict[str, Any] = {}
@@ -310,11 +296,9 @@ def extract_exif(image_path: Path) -> Dict[str, Any]:
         pass
     return result
 
-
 # ---------------------------------------------------------------------------
 # Download / image helpers
 # ---------------------------------------------------------------------------
-
 
 def build_http_session(proxy_url: str = "") -> requests.Session:
     session = requests.Session()
@@ -342,10 +326,7 @@ def build_http_session(proxy_url: str = "") -> requests.Session:
 
     return session
 
-
-def download_image(
-    session: requests.Session, url: Optional[str], destination: Path
-) -> Optional[Path]:
+def download_image(session: requests.Session, url: Optional[str], destination: Path) -> Optional[Path]:
     if not url:
         return None
     try:
@@ -364,10 +345,7 @@ def download_image(
         destination.unlink(missing_ok=True)
         return None
 
-
-def prepare_image_for_gemini(
-    source: Path, output_dir: Path, index: int
-) -> Optional[Path]:
+def prepare_image_for_gemini(source: Path, output_dir: Path, index: int) -> Optional[Path]:
     try:
         output_dir.mkdir(parents=True, exist_ok=True)
         with Image.open(source) as img:
@@ -380,11 +358,9 @@ def prepare_image_for_gemini(
     except Exception:
         return None
 
-
 # ---------------------------------------------------------------------------
 # Profile collection
 # ---------------------------------------------------------------------------
-
 
 def collect_profile_data(
     username: str,
@@ -392,6 +368,7 @@ def collect_profile_data(
     max_images: int,
     temp_dir: Path,
     proxy_url: str,
+    session_file: Optional[str],
     console: Console,
 ) -> Tuple[Dict[str, Any], List[Path]]:
     session = build_http_session(proxy_url)
@@ -406,9 +383,17 @@ def collect_profile_data(
         request_timeout=60,
     )
 
-    # Route every Instaloader request through proxy
-    apply_proxy_to_loader(loader, proxy_url)
+    # Load session if provided (bypass 429)
+    if session_file and Path(session_file).exists():
+        try:
+            # Extract username from session filename (session-username)
+            ig_user = session_file.replace("session-", "")
+            loader.load_session_from_file(ig_user, session_file)
+            console.print(f"[green]✓ Loaded session: {session_file}[/green]")
+        except Exception as e:
+            console.print(f"[yellow]⚠ Failed to load session: {e}[/yellow]")
 
+    apply_proxy_to_loader(loader, proxy_url)
     profile = Profile.from_username(loader.context, username)
 
     evidence: Dict[str, Any] = {
@@ -428,6 +413,7 @@ def collect_profile_data(
         "private_notice": None,
         "collection_errors": [],
         "proxy_used": proxy_url or None,
+        "session_used": session_file or None,
     }
 
     try:
@@ -453,9 +439,7 @@ def collect_profile_data(
             gemini_images.append(prepared)
 
     if profile.is_private:
-        evidence["private_notice"] = (
-            "Profile is private. Posts and media are not publicly accessible."
-        )
+        evidence["private_notice"] = "Profile is private."
         return evidence, gemini_images
 
     post_index = 0
@@ -489,9 +473,7 @@ def collect_profile_data(
                 if not post.is_video and getattr(post, "url", None):
                     image_urls.append(post.url)
 
-            for img_index, image_url in enumerate(
-                image_urls[: max(0, max_images - len(gemini_images))]
-            ):
+            for img_index, image_url in enumerate(image_urls[: max(0, max_images - len(gemini_images))]):
                 dest = temp_dir / f"post_{post_index:03d}_{img_index}.jpg"
                 downloaded = download_image(session, image_url, dest)
                 if not downloaded:
@@ -501,9 +483,7 @@ def collect_profile_data(
 
                 exif = extract_exif(downloaded)
                 if exif:
-                    evidence["exif"].append(
-                        {"source": f"post_{post.shortcode}_{img_index}", "metadata": exif}
-                    )
+                    evidence["exif"].append({"source": f"post_{post.shortcode}_{img_index}", "metadata": exif})
 
                 if len(gemini_images) < max_images:
                     prepared = prepare_image_for_gemini(downloaded, gemini_dir, len(gemini_images))
@@ -520,11 +500,9 @@ def collect_profile_data(
 
     return evidence, gemini_images
 
-
 # ---------------------------------------------------------------------------
 # Gemini analysis
 # ---------------------------------------------------------------------------
-
 
 def build_gemini_prompt(evidence: Dict[str, Any]) -> str:
     evidence_json = json.dumps(evidence, indent=2, ensure_ascii=False, default=str)
@@ -600,24 +578,13 @@ RULES:
 - Do not include any text outside the Markdown report.
 """
 
-
-def analyze_with_gemini(
-    api_key: str,
-    evidence: Dict[str, Any],
-    image_paths: List[Path],
-    console: Console,
-) -> str:
+def analyze_with_gemini(api_key: str, evidence: Dict[str, Any], image_paths: List[Path]) -> str:
     prompt = build_gemini_prompt(evidence)
 
     contents: List[Any] = [prompt]
     for image_path in image_paths:
         try:
-            contents.append(
-                types.Part.from_bytes(
-                    data=image_path.read_bytes(),
-                    mime_type="image/jpeg",
-                )
-            )
+            contents.append(types.Part.from_bytes(data=image_path.read_bytes(), mime_type="image/jpeg"))
         except Exception:
             continue
 
@@ -627,11 +594,7 @@ def analyze_with_gemini(
     last_error: Optional[Exception] = None
     for attempt in range(3):
         try:
-            response = client.models.generate_content(
-                model=GEMINI_MODEL,
-                contents=contents,
-                config=config,
-            )
+            response = client.models.generate_content(model=GEMINI_MODEL, contents=contents, config=config)
             text = getattr(response, "text", None)
             if text and text.strip():
                 return text.strip()
@@ -643,70 +606,34 @@ def analyze_with_gemini(
 
     raise RuntimeError(f"Gemini analysis failed: {last_error}")
 
-
 # ---------------------------------------------------------------------------
 # Fallback report / output
 # ---------------------------------------------------------------------------
 
-
 def fallback_report(evidence: Dict[str, Any], error: str) -> str:
     username = evidence.get("username", "unknown")
-    exif_count = len(evidence.get("exif", []))
-    post_count = len(evidence.get("posts", []))
+    return f"""# OSINT Investigation Report — @{username}
 
-    lines = [
-        f"# OSINT Investigation Report — @{username}",
-        "",
-        "## 1. Profile Summary",
-        f"- **Username:** @{username}",
-        f"- **Full Name:** {evidence.get('full_name') or 'N/A'}",
-        f"- **Bio:** {evidence.get('biography') or 'N/A'}",
-        f"- **External URL:** {evidence.get('external_url') or 'N/A'}",
-        f"- **Followers:** {evidence.get('followers')}",
-        f"- **Followees:** {evidence.get('followees')}",
-        f"- **Media Count:** {evidence.get('media_count')}",
-        f"- **Private:** {evidence.get('is_private')}",
-        f"- **Proxy Used:** {evidence.get('proxy_used') or 'none'}",
-        "",
-        "## 2. Key Visual & Textual Evidence",
-        f"- Posts collected: {post_count}",
-        f"- EXIF records extracted: {exif_count}",
-        "- Automated Gemini visual analysis was unavailable.",
-        "",
-        "## 3. Metadata / EXIF Findings",
-    ]
+## 1. Profile Summary
+- **Username:** @{username}
+- **Bio:** {evidence.get('biography') or 'N/A'}
+- **Followers:** {evidence.get('followers')}
 
-    if evidence.get("exif"):
-        for record in evidence["exif"][:10]:
-            lines.append(
-                f"- **{record.get('source')}:** "
-                f"`{json.dumps(record.get('metadata', {}), ensure_ascii=False)}`"
-            )
-    else:
-        lines.append("- No EXIF metadata found in downloaded images.")
+## 2. Key Visual & Textual Evidence
+- Automated Gemini visual analysis was unavailable.
 
-    lines.extend(
-        [
-            "",
-            "## 4. Estimated Country / Region & Confidence",
-            "- **Confidence:** LOW",
-            f"- Gemini analysis failed: `{error}`",
-            "- No automated geographic estimate is available.",
-            "",
-            "## 5. Analyst Notes",
-            "- Review the saved evidence JSON manually.",
-            "- Retry with a valid Gemini API key for multimodal analysis.",
-        ]
-    )
+## 3. Metadata / EXIF Findings
+- EXIF records extracted: {len(evidence.get('exif', []))}
 
-    return "\n".join(lines)
+## 4. Estimated Country / Region & Confidence
+- **Confidence:** LOW
+- Gemini analysis failed: `{error}`
 
+## 5. Analyst Notes
+- Review the saved evidence JSON manually.
+"""
 
-def save_outputs(
-    username: str,
-    report_md: str,
-    evidence: Dict[str, Any],
-) -> Tuple[Path, Path]:
+def save_outputs(username: str, report_md: str, evidence: Dict[str, Any]) -> Tuple[Path, Path]:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     safe_username = re.sub(r"[^A-Za-z0-9_.-]", "_", username)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
@@ -715,225 +642,115 @@ def save_outputs(
     evidence_path = OUTPUT_DIR / f"osint_{safe_username}_{stamp}_evidence.json"
 
     report_path.write_text(report_md, encoding="utf-8")
-    evidence_path.write_text(
-        json.dumps(evidence, indent=2, ensure_ascii=False, default=str),
-        encoding="utf-8",
-    )
+    evidence_path.write_text(json.dumps(evidence, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
     return report_path, evidence_path
-
 
 # ---------------------------------------------------------------------------
 # CLI / main
 # ---------------------------------------------------------------------------
 
-
 def print_evidence_summary(evidence: Dict[str, Any]) -> None:
-    table = Table(
-        title="Collected Evidence",
-        box=box.ROUNDED,
-        show_header=True,
-        header_style="bold cyan",
-    )
+    table = Table(title="Collected Evidence", box=box.ROUNDED, header_style="bold cyan")
     table.add_column("Field", style="dim")
     table.add_column("Value", overflow="fold")
 
     table.add_row("Username", f"@{evidence.get('username')}")
     table.add_row("Full Name", str(evidence.get("full_name") or "N/A"))
-    table.add_row("Bio", (evidence.get("biography") or "N/A")[:180])
-    table.add_row("External URL", str(evidence.get("external_url") or "N/A"))
     table.add_row("Followers", str(evidence.get("followers")))
     table.add_row("Posts Fetched", str(len(evidence.get("posts", []))))
     table.add_row("EXIF Records", str(len(evidence.get("exif", []))))
-    table.add_row("Private", str(evidence.get("is_private")))
     table.add_row("Proxy Used", str(evidence.get("proxy_used") or "none"))
-
-    if evidence.get("private_notice"):
-        table.add_row("Notice", evidence["private_notice"])
+    table.add_row("Session Used", str(evidence.get("session_used") or "none"))
 
     console.print(table)
 
-
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="IG-OSINT — Public Instagram OSINT & geolocation analyzer with proxy IP masking."
-    )
-    parser.add_argument(
-        "--username",
-        help="Instagram username to analyze (skips interactive prompt).",
-    )
-    parser.add_argument(
-        "--reset-key",
-        action="store_true",
-        help="Delete the saved Gemini API key and prompt for a new one.",
-    )
-    parser.add_argument(
-        "--max-posts",
-        type=int,
-        default=8,
-        help="Maximum number of recent posts to collect (default: 8).",
-    )
-    parser.add_argument(
-        "--max-images",
-        type=int,
-        default=10,
-        help="Maximum number of images to send to Gemini (default: 10).",
-    )
-    parser.add_argument(
-        "--proxy",
-        default=None,
-        help="Proxy URL (e.g., socks5://127.0.0.1:9050). Skips interactive prompt.",
-    )
-    parser.add_argument(
-        "--no-proxy",
-        action="store_true",
-        help="Disable proxy (traffic uses real IP).",
-    )
+    parser = argparse.ArgumentParser(description="IG-OSINT — Public Instagram OSINT.")
+    parser.add_argument("--username", help="Instagram username.")
+    parser.add_argument("--reset-key", action="store_true", help="Reset Gemini key.")
+    parser.add_argument("--max-posts", type=int, default=8, help="Max posts.")
+    parser.add_argument("--max-images", type=int, default=10, help="Max images.")
+    parser.add_argument("--proxy", default=None, help="Proxy URL.")
+    parser.add_argument("--no-proxy", action="store_true", help="Disable proxy.")
+    parser.add_argument("--session", default=None, help="Instaloader session file (e.g., session-user).")
     return parser.parse_args()
-
 
 def main() -> int:
     args = parse_args()
 
-    console.print(
-        Panel(
-            Align.center(BANNER),
-            title=f"[bold cyan]{TOOL_NAME} v{VERSION}[/bold cyan]",
-            subtitle="Public Instagram OSINT & Geolocation Engine",
-            border_style="cyan",
-            expand=True,
-            width=console.width,
-            padding=(0, 1),
-        )
-    )
-    console.print(
-        "[dim]For lawful analysis of public profiles only. "
-        "Respect platform terms and local privacy laws.[/dim]\n"
-    )
+    console.print(Panel(Align.center(BANNER), title=f"[bold cyan]{TOOL_NAME} v{VERSION}[/bold cyan]", border_style="cyan", expand=True, width=console.width))
 
-    # ---------- Proxy setup (interactive) ----------
+    # 1. Proxy Setup
     if args.no_proxy:
         proxy_url = ""
-        console.print("[yellow]Proxy disabled (--no-proxy).[/yellow]")
     elif args.proxy:
         proxy_url = normalize_proxy(args.proxy)
         apply_proxy_env(proxy_url)
-        exit_ip = verify_proxy(proxy_url)
-        if exit_ip:
-            console.print(
-                f"[green]✓ Proxy (CLI):[/green] [cyan]{proxy_url}[/cyan] "
-                f"[dim]→ exit IP {exit_ip}[/dim]"
-            )
-        else:
-            console.print(
-                f"[yellow]⚠ Proxy set via CLI but unverified: {proxy_url}[/yellow]"
-            )
+        verify_proxy(proxy_url)
     else:
         proxy_url = prompt_proxy()
         apply_proxy_env(proxy_url)
 
-    # ---------- Gemini API key (interactive) ----------
+    # 2. Session Setup
+    console.print()
+    session_file = args.session if args.session else prompt_session()
+
+    # 3. API Key Setup
     console.print()
     api_key = resolve_api_key(reset=args.reset_key)
     if not api_key:
         console.print("[red]No Gemini API key provided. Exiting.[/red]")
         return 1
 
-    # ---------- Target ID (interactive) ----------
-    username = args.username or Prompt.ask(
-        "Enter target Instagram ID"
-    ).strip().lstrip("@")
+    # 4. Target Setup
+    username = args.username or Prompt.ask("Enter target Instagram ID").strip().lstrip("@")
     if not username:
-        console.print("[red]No target username provided. Exiting.[/red]")
         return 1
-
-    console.print(
-        Panel(
-            f"[bold]Target:[/bold] @{username}\n"
-            f"[bold]Proxy:[/bold] {proxy_url or 'disabled (real IP)'}\n"
-            f"[bold]Gemini key:[/bold] {mask_key(api_key)}",
-            title="Session",
-            border_style="cyan",
-        )
-    )
 
     temp_dir = Path(tempfile.mkdtemp(prefix="ig_osint_"))
     evidence: Dict[str, Any] = {}
     gemini_images: List[Path] = []
 
     try:
-        with console.status(
-            "[bold cyan]Fetching public profile, posts, and EXIF through proxy...[/bold cyan]",
-            spinner="dots",
-        ):
+        with console.status("[bold cyan]Fetching profile through proxy...[/bold cyan]", spinner="dots"):
             evidence, gemini_images = collect_profile_data(
                 username=username,
                 max_posts=max(0, args.max_posts),
                 max_images=max(0, args.max_images),
                 temp_dir=temp_dir,
                 proxy_url=proxy_url,
+                session_file=session_file,
                 console=console,
             )
 
         print_evidence_summary(evidence)
 
         if evidence.get("collection_errors"):
-            console.print("\n[yellow]Collection warnings:[/yellow]")
-            for warning in evidence["collection_errors"]:
-                console.print(f"  [yellow]• {warning}[/yellow]")
+            for w in evidence["collection_errors"]:
+                console.print(f"[yellow]• {w}[/yellow]")
 
-        report_md: str
         try:
-            with console.status(
-                "[bold magenta]Running Gemini multimodal OSINT analysis...[/bold magenta]",
-                spinner="dots12",
-            ):
-                report_md = analyze_with_gemini(
-                    api_key=api_key,
-                    evidence=evidence,
-                    image_paths=gemini_images,
-                    console=console,
-                )
+            with console.status("[bold magenta]Gemini analysis...[/bold magenta]", spinner="dots12"):
+                report_md = analyze_with_gemini(api_key, evidence, gemini_images)
         except Exception as exc:
-            console.print(f"\n[yellow]Gemini analysis unavailable: {exc}[/yellow]")
+            console.print(f"[yellow]Gemini unavailable: {exc}[/yellow]")
             report_md = fallback_report(evidence, str(exc))
 
-        report_path, evidence_path = save_outputs(
-            username=username,
-            report_md=report_md,
-            evidence=evidence,
-        )
+        report_path, evidence_path = save_outputs(username, report_md, evidence)
 
         console.rule("[bold green]FINAL OSINT REPORT[/bold green]")
         console.print(Markdown(report_md))
-
-        console.print(
-            Panel(
-                f"[green]Report saved:[/green] {report_path}\n"
-                f"[green]Evidence JSON:[/green] {evidence_path}",
-                title="Archived",
-                border_style="green",
-            )
-        )
+        console.print(Panel(f"[green]Report:[/green] {report_path}\n[green]JSON:[/green] {evidence_path}", title="Archived", border_style="green"))
         return 0
 
     except KeyboardInterrupt:
-        console.print("\n[yellow]Interrupted by user.[/yellow]")
+        console.print("\n[yellow]Interrupted.[/yellow]")
         return 130
-    except InstaloaderException as exc:
-        console.print(f"[red]Instagram error:[/red] {exc}")
-        return 1
-    except requests.RequestException as exc:
-        console.print(f"[red]Network error:[/red] {exc}")
-        return 1
     except Exception as exc:
-        console.print(f"[red]Unexpected error:[/red] {exc}")
+        console.print(f"[red]Error:[/red] {exc}")
         return 1
     finally:
-        try:
-            shutil.rmtree(temp_dir, ignore_errors=True)
-        except Exception:
-            pass
-
+        shutil.rmtree(temp_dir, ignore_errors=True)
 
 if __name__ == "__main__":
     sys.exit(main())
